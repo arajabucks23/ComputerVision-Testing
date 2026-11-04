@@ -11,8 +11,12 @@ if (Test-Path (Join-Path $dst "Drivers\STM32F7xx_HAL_Driver\Inc")) {
 }
 
 $commit = "79165e2"   # STM32CubeF7 commit used for this project
-git clone --filter=blob:none --sparse https://github.com/STMicroelectronics/STM32CubeF7.git $dst
+# core.longpaths: lwIP's doxygen docs have very long file names, which break
+# Windows' 260-character path limit when the project sits in a deep folder.
+# (-c settings are passed on to the submodule clones too.)
+git -c core.longpaths=true clone --filter=blob:none --sparse https://github.com/STMicroelectronics/STM32CubeF7.git $dst
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+git -C $dst config core.longpaths true
 git -C $dst checkout $commit
 git -C $dst sparse-checkout set --no-cone `
     '/.gitmodules' `
@@ -23,7 +27,7 @@ git -C $dst sparse-checkout set --no-cone `
     '/Middlewares/Third_Party/LwIP/*' `
     '/Projects/STM32F746ZG-Nucleo/Applications/LwIP/*' `
     '/Projects/STM32F769I_EVAL/Applications/LwIP/LwIP_HTTP_Server_Raw/*'
-git -C $dst submodule update --init --depth 1 `
+git -c core.longpaths=true -C $dst submodule update --init --depth 1 `
     Drivers/STM32F7xx_HAL_Driver `
     Drivers/CMSIS/Device/ST/STM32F7xx `
     Drivers/BSP/Components/lan8742 `
