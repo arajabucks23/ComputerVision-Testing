@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editors / tools
+.vscode/
+.idea/
+.claude/
+.dist/
+
+# Model weights: downloaded automatically by ultralytics on first run
+# (yolov8s-worldv2-obstacles.pt is rebuilt from yolov8s-worldv2.pt + CLIP)
+*.pt
+cv_node/weights/
+
+# Generated output
+results/
+snapshots/
+cv_node/snapshots/
+*.jsonl
+
+# Online test clips: downloaded from the internet, not ours to redistribute.
+# Put them back in test_footage/online/ locally (see README).
+test_footage/online/
+
+# STM32 firmware: build output, and ST's libraries (fetched by
+# stm32_camera/firmware/fetch_st_libs.ps1, about 63 MB)
+stm32_camera/firmware/build/
+stm32_camera/firmware/st_cubef7/
