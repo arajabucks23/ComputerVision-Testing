@@ -6,6 +6,10 @@
  *   - LD1 (green) blinks twice a second while the main loop runs.
  *   - The board answers ping on 192.168.10.2.
  * The camera stays powered down and in reset until step 2.
+ *
+ * WS2812B strip on PE9 (TIM1_CH1): ws2812.c, patterns in led_modes.c, commands from
+ * the laptop on UDP 5005 / GET /led (led_command.c). Build with -DLED_TEST_ONLY=ON
+ * for an LED-only image that starts nothing else.
  */
 #include <stdio.h>
 #include "main.h"
@@ -21,6 +25,9 @@
 #include "http_server.h"
 #include "capture.h"
 #include "adc.h"
+#include "ws2812.h"
+#include "led_modes.h"
+#include "led_command.h"
 
 UART_HandleTypeDef huart3;
 static struct netif gnetif;
@@ -32,6 +39,70 @@ static void Netif_Config(void);
 
 #define measure_vdd_mv adc_vdd_mv   /* supply voltage, see adc.c */
 
+#if LED_TEST_ONLY
+/*
+ * LED-only bring-up (cmake -DLED_TEST_ONLY=ON): no Ethernet, camera or DHT11.
+ * All 160 LEDs are written off, then only LEDs 0-7 dim white; the same frame is
+ * resent twice a second. LD1 blinks while it runs.
+ */
+#if LED_PIN_TEST
+/* Wiring check with a multimeter (cmake -DLED_PIN_TEST=ON): PE9 as a plain GPIO,
+ * 3 s high / 3 s low. Disconnect the 330 ohm resistor from DIN while it runs. */
+static void led_pin_test(void)
+{
+  GPIO_InitTypeDef g = {0};
+
+  g.Pin = GPIO_PIN_9;
+  g.Mode = GPIO_MODE_OUTPUT_PP;
+  g.Pull = GPIO_NOPULL;
+  g.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOE, &g);
+  printf("[pin-test] PE9 (D6) toggles every 3 s. Strip DIN must be disconnected.\r\n");
+  while (1)
+  {
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(LED_GREEN_PORT, LED_GREEN_PIN, GPIO_PIN_SET);
+    printf("[pin-test] HIGH: D6 ~3.3 V, AHCT125 pin 2 ~3.3 V, pin 3 ~5 V\r\n");
+    HAL_Delay(3000);
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LED_GREEN_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
+    printf("[pin-test] LOW:  D6 ~0 V,   AHCT125 pin 2 ~0 V,   pin 3 ~0 V\r\n");
+    HAL_Delay(3000);
+  }
+}
+#endif
+
+static void led_test_only(void)
+{
+#if LED_PIN_TEST
+  led_pin_test();
+#endif
+  uint32_t last_send = 0, last_print = HAL_GetTick();
+
+  printf("[led-test] LED-only firmware: Ethernet, camera and DHT11 are NOT started\r\n");
+  ws2812_print_timing();
+  printf("[led-test] all %u LEDs off, then LEDs 0-7 white at level 8/255\r\n", (unsigned)WS2812_NUM_LEDS);
+  while (1)
+  {
+    if (HAL_GetTick() - last_send >= 500)
+    {
+      led_modes_draw(LED_MODE_TEST, HAL_GetTick());
+      if (ws2812_show() == 0)
+      {
+        last_send = HAL_GetTick();
+        HAL_GPIO_TogglePin(LED_GREEN_PORT, LED_GREEN_PIN);
+      }
+    }
+    if (HAL_GetTick() - last_print >= 5000)
+    {
+      last_print = HAL_GetTick();
+      printf("[led-test] frames sent %lu, DMA errors %lu\r\n",
+             (unsigned long)ws2812_frames_sent(), (unsigned long)ws2812_errors());
+    }
+  }
+}
+#endif
+
 int main(void)
 {
   /* Instruction cache on. The data cache stays OFF so DMA buffers (camera,
@@ -42,14 +113,23 @@ int main(void)
   HAL_Init();
   SystemClock_Config();
   GPIO_Init();
+  ws2812_init();                      /* first: drive the strip's data line and clear all LEDs */
   USART3_Init();
   setvbuf(stdout, NULL, _IONBF, 0);   /* printf goes out immediately */
 
   printf("\r\n[boot] EvacAI camera node, SYSCLK = %lu Hz\r\n", HAL_RCC_GetSysClockFreq());
 
+#if LED_TEST_ONLY
+  led_test_only();
+#endif
+
+  ws2812_print_timing();
+  led_modes_init();
+
   lwip_init();
   Netif_Config();
   http_server_init();
+  led_command_init();
   printf("[boot] IP %s, log at http://192.168.10.2/log\r\n", ip4addr_ntoa(netif_ip4_addr(&gnetif)));
 
   /* DHT11 before anything else draws current (camera still off): tells apart
@@ -93,6 +173,7 @@ int main(void)
   {
     ethernetif_poll(&gnetif);   /* received packets -> lwIP, link up/down */
     sys_check_timeouts();       /* lwIP timers (ARP, TCP) */
+    led_modes_poll();           /* LED strip animation and no-signal timeout */
     if (camera_ok)
     {
       capture_poll();           /* finished frame -> ready buffer, restart DCMI */

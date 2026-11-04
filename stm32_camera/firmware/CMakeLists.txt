@@ -15,7 +15,8 @@ set(LWIP_DIR ${ST}/Middlewares/Third_Party/LwIP)
 include(${LWIP_DIR}/src/Filelists.cmake)
 
 set(HAL_MODULES hal hal_cortex hal_rcc hal_rcc_ex hal_gpio hal_dma hal_dma_ex hal_pwr hal_pwr_ex
-                hal_flash hal_flash_ex hal_uart hal_uart_ex hal_i2c hal_i2c_ex hal_eth hal_dcmi hal_dcmi_ex)
+                hal_flash hal_flash_ex hal_uart hal_uart_ex hal_i2c hal_i2c_ex hal_eth hal_dcmi hal_dcmi_ex
+                hal_tim hal_tim_ex)
 list(TRANSFORM HAL_MODULES PREPEND ${HAL}/Src/stm32f7xx_)
 list(TRANSFORM HAL_MODULES APPEND .c)
 
@@ -31,6 +32,9 @@ add_executable(evac_cam
   Core/Src/http_server.c
   Core/Src/capture.c
   Core/Src/adc.c
+  Core/Src/ws2812.c
+  Core/Src/led_modes.c
+  Core/Src/led_command.c
   ${ST}/Drivers/CMSIS/Device/ST/STM32F7xx/Source/Templates/gcc/startup_stm32f746xx.s
   ${ST}/Drivers/CMSIS/Device/ST/STM32F7xx/Source/Templates/system_stm32f7xx.c
   ${HAL_MODULES}
@@ -43,6 +47,18 @@ add_executable(evac_cam
 )
 
 target_compile_definitions(evac_cam PRIVATE STM32F746xx USE_HAL_DRIVER)
+
+# LED-only bring-up image: clocks, serial and the WS2812B strip; no Ethernet, camera or DHT11.
+option(LED_TEST_ONLY "Build the LED-only test firmware" OFF)
+if(LED_TEST_ONLY)
+  target_compile_definitions(evac_cam PRIVATE LED_TEST_ONLY=1)
+endif()
+
+# Wiring check: PE9 toggles slowly as a plain GPIO, for a multimeter (implies LED_TEST_ONLY).
+option(LED_PIN_TEST "Build the PE9 pin-toggle wiring check" OFF)
+if(LED_PIN_TEST)
+  target_compile_definitions(evac_cam PRIVATE LED_TEST_ONLY=1 LED_PIN_TEST=1)
+endif()
 target_include_directories(evac_cam PRIVATE
   Core/Inc
   ${HAL}/Inc

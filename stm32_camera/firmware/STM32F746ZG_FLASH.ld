@@ -3,7 +3,8 @@
  *
  * RAM plan (320 KB total):
  *   DTCM  0x20000000  64 KB  code variables, lwIP heap and pools, C heap, stack
- *   SRAM1 0x20010000 240 KB  JPEG frame buffers (section .frame_buffers, from step 4)
+ *   SRAM1 0x20010000 240 KB  JPEG frame buffers (section .frame_buffers, from step 4),
+ *                            then the WS2812B DMA buffer (section .led_dma, ~7.5 KB)
  *   SRAM2 0x2004C000  16 KB  Ethernet DMA descriptors + receive buffers (section .eth_dma)
  * The F7's DMA controllers and Ethernet DMA can all reach DTCM, SRAM1 and SRAM2.
  */
@@ -122,6 +123,13 @@ SECTIONS
     . = ALIGN(32);
     *(.frame_buffers)
     *(.frame_buffers*)
+  } >SRAM1
+
+  .led_dma (NOLOAD) :
+  {
+    . = ALIGN(32);
+    *(.led_dma)
+    *(.led_dma*)
   } >SRAM1
 
   .eth_dma (NOLOAD) :

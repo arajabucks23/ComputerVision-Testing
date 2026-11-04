@@ -5,6 +5,8 @@
  *                       Opens in a browser, VLC and cv2.VideoCapture(url).
  *   GET /status      -> stream/capture counters as text
  *   GET /log         -> the board's log as text/plain
+ *   GET /led?mode=X  -> set the LED strip mode (X = STRAIGHT, LEFT, RIGHT, UNSAFE, OFF, TEST)
+ *   GET /led         -> LED strip status
  *
  * One stream client at a time: a new viewer replaces the old one, and a client that
  * takes no data for 5 s is dropped (so a dead connection never blocks the stream).
@@ -21,6 +23,8 @@
 #include "dht11.h"
 #include "adc.h"
 #include "log.h"
+#include "led_command.h"
+#include "led_modes.h"
 
 typedef struct
 {
@@ -183,7 +187,7 @@ static void answer_and_close(struct tcp_pcb *pcb, const char *status_and_headers
 
 static err_t on_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 {
-  char req[32] = {0};
+  char req[64] = {0};
   (void)err;
 
   if (p == NULL)                 /* client closed */
@@ -211,9 +215,27 @@ static err_t on_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
     answer_and_close(pcb, "HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
                           "Connection: close\r\n\r\n", 1);
   }
+  else if (strncmp(req, "GET /led", 8) == 0)
+  {
+    static char text[256];
+    char cmd[16] = "STATUS";
+    const char *q = strstr(req, "mode=");
+    if (q != NULL)
+    {
+      size_t i = 0;
+      for (q += 5; *q && *q != ' ' && *q != '&' && i < sizeof(cmd) - 1; q++)
+        cmd[i++] = *q;
+      cmd[i] = '\0';
+    }
+    int n = snprintf(text, sizeof(text), "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n");
+    n += led_command_handle(cmd, text + n, sizeof(text) - (size_t)n);
+    tcp_write(pcb, text, (u16_t)n, TCP_WRITE_FLAG_COPY);
+    tcp_output(pcb);
+    tcp_close(pcb);
+  }
   else if (strncmp(req, "GET /status", 11) == 0)
   {
-    static char text[640];
+    static char text[768];
     const capture_stats_t *s = capture_stats();
     struct tcp_pcb *sp = stream.pcb;
     int n = snprintf(text, sizeof(text),
@@ -223,7 +245,8 @@ static err_t on_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
       "stream_tcp_state %d  sndbuf %u  queuelen %u  unacked %s\r\n"
       "stream_frame %lu  offset %lu of %lu  ms_since_progress %lu\r\n"
       "frames_sent %lu  clients_replaced %lu  clients_stalled %lu\r\n"
-      "captured_ok %lu  bad %lu  too_big %lu  skipped %lu  dcmi_errors %lu  timeouts %lu\r\n",
+      "captured_ok %lu  bad %lu  too_big %lu  skipped %lu  dcmi_errors %lu  timeouts %lu\r\n"
+      "led_mode %s  ms_since_command %lu\r\n",
       (unsigned long)(HAL_GetTick() / 1000),
       sp ? ipaddr_ntoa(&sp->remote_ip) : "none",
       sp ? (int)sp->state : -1, sp ? (unsigned)tcp_sndbuf(sp) : 0u,
@@ -232,7 +255,8 @@ static err_t on_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
       (unsigned long)(sp ? HAL_GetTick() - last_progress : 0),
       (unsigned long)frames_sent, (unsigned long)stream_kicked, (unsigned long)stream_stalled,
       (unsigned long)s->frames_ok, (unsigned long)s->frames_bad, (unsigned long)s->frames_too_big,
-      (unsigned long)s->frames_skipped, (unsigned long)s->dcmi_errors, (unsigned long)s->timeouts);
+      (unsigned long)s->frames_skipped, (unsigned long)s->dcmi_errors, (unsigned long)s->timeouts,
+      led_mode_name(led_modes_current()), (unsigned long)led_modes_ms_since_command());
     tcp_write(pcb, text, (u16_t)n, TCP_WRITE_FLAG_COPY);
     tcp_output(pcb);
     tcp_close(pcb);
@@ -256,7 +280,7 @@ static err_t on_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
   else
   {
     answer_and_close(pcb, "HTTP/1.0 404 Not Found\r\nContent-Type: text/plain\r\n\r\n"
-                          "Try /stream, /status or /log\r\n", 0);
+                          "Try /stream, /status, /log or /led?mode=LEFT\r\n", 0);
   }
   return ERR_OK;
 }

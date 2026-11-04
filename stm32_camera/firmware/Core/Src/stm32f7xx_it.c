@@ -19,6 +19,14 @@ void DMA2_Stream1_IRQHandler(void)
   HAL_DMA_IRQHandler(hdcmi.DMA_Handle);
 }
 
+/* WS2812B strip (ws2812.c): TIM1_UP DMA, end of frame */
+extern DMA_HandleTypeDef hdma_ws2812;
+
+void DMA2_Stream5_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_ws2812);
+}
+
 void HardFault_Handler(void)
 {
   Error_Handler();
