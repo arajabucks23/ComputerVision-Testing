@@ -29,3 +29,7 @@ test_footage/online/
 # stm32_camera/firmware/fetch_st_libs.ps1, about 63 MB)
 stm32_camera/firmware/build/
 stm32_camera/firmware/st_cubef7/
+
+# Mac firmware build
+stm32_camera/firmware/build-mac/
+stm32_camera/firmware/st_cubef7
