@@ -1,9 +1,10 @@
 /*
  * Evacuation guidance patterns on the WS2812B strip.
  *
- *   STRAIGHT   green comets from both ends moving towards the middle
+ *   STRAIGHT   green comets from both ends moving towards the middle (into exit)
  *   LEFT       green comets travelling right-to-left
  *   RIGHT      green comets travelling left-to-right
+ *   AWAY       amber comets from the middle moving towards both ends (exit closed)
  *   UNSAFE     all LEDs flash red, 2 Hz
  *   TEST       only LEDs 0-7, dim white; all others off (shown at boot)
  *   OFF        all off
@@ -28,6 +29,7 @@ typedef enum
   LED_MODE_STRAIGHT,
   LED_MODE_LEFT,
   LED_MODE_RIGHT,
+  LED_MODE_AWAY,
   LED_MODE_UNSAFE,
   LED_MODE_NO_SIGNAL,
 } led_mode_t;

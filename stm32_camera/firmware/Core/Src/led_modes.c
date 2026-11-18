@@ -38,6 +38,7 @@ static const char *const names[] = {
   [LED_MODE_STRAIGHT] = "STRAIGHT",
   [LED_MODE_LEFT] = "LEFT",
   [LED_MODE_RIGHT] = "RIGHT",
+  [LED_MODE_AWAY] = "AWAY",
   [LED_MODE_UNSAFE] = "UNSAFE",
   [LED_MODE_NO_SIGNAL] = "NO_SIGNAL",
 };
@@ -84,13 +85,26 @@ static void draw_chase(int towards_high, uint32_t now)
     ws2812_set(i, 0, chase_level(towards_high ? i : WS2812_NUM_LEDS - 1U - i, now), 0);
 }
 
-/* Both halves move towards the middle; mirrored, so it doesn't depend on LED_INDEX0_AT_LEFT. */
+/* Both halves move towards the middle (into the exit). */
 static void draw_converge(uint32_t now)
 {
   for (uint32_t i = 0; i < WS2812_NUM_LEDS; i++)
   {
     uint32_t p = i < WS2812_NUM_LEDS / 2U ? i : WS2812_NUM_LEDS - 1U - i;
     ws2812_set(i, 0, chase_level(p, now), 0);
+  }
+}
+
+/* Opposite of converge: both halves move away from the middle (exit closed).
+ * Amber (R+G) so it is obvious vs green STRAIGHT / LEFT / RIGHT. */
+static void draw_diverge(uint32_t now)
+{
+  uint32_t mid = WS2812_NUM_LEDS / 2U;
+  for (uint32_t i = 0; i < WS2812_NUM_LEDS; i++)
+  {
+    uint32_t p = i < mid ? (mid - 1U - i) : (i - mid);
+    uint8_t lvl = chase_level(p, now);
+    ws2812_set(i, lvl, (uint8_t)(lvl / 2U), 0);   /* amber */
   }
 }
 
@@ -108,7 +122,7 @@ void led_modes_draw(led_mode_t m, uint32_t now)
       break;
 
     case LED_MODE_STRAIGHT:
-      draw_converge(now);
+      draw_converge(now);       /* into the exit: towards the middle */
       break;
 
     case LED_MODE_LEFT:
@@ -117,6 +131,10 @@ void led_modes_draw(led_mode_t m, uint32_t now)
 
     case LED_MODE_RIGHT:
       draw_chase(LED_INDEX0_AT_LEFT, now);
+      break;
+
+    case LED_MODE_AWAY:
+      draw_diverge(now);        /* exit closed: away from the middle */
       break;
 
     case LED_MODE_UNSAFE:

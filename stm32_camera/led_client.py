@@ -20,7 +20,7 @@ import time
 
 BOARD_IP = "192.168.10.2"
 LED_PORT = 5005
-MODES = ("STRAIGHT", "LEFT", "RIGHT", "UNSAFE", "OFF", "TEST")
+MODES = ("STRAIGHT", "LEFT", "RIGHT", "AWAY", "UNSAFE", "OFF", "TEST")
 
 
 class LedStrip:

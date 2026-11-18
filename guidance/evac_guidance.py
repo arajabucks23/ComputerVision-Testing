@@ -16,9 +16,12 @@ EvacAI live guidance: STM32 camera -> person detection -> LED strip direction.
     the board's 5 s NO_SIGNAL timeout never fires while this runs.
   * If the camera stream stops, the heartbeat stops too, so the strip falls back to
     NO_SIGNAL (amber) instead of showing a stale direction.
-  * Person steering uses LEFT / STRAIGHT / RIGHT / OFF. A spike on the board's
-    MiCS-5524 CO sensor (breath / alcohol / VOCs) overrides to UNSAFE (flashing red)
-    until the reading settles again. Raise the strip supply limit to ~1 A for UNSAFE.
+  * Person steering uses LEFT / STRAIGHT / RIGHT / OFF when the exit is open.
+  * Simulated hazard: a trash can in view (YOLO-World) -> UNSAFE (flashing red).
+  * Occupancy gate: if --max-people or more people are in frame (default 3), the
+    strip shows AWAY (diverge). Crowd AWAY still wins over direction; trash UNSAFE
+    wins over crowd so the hazard demo is visible.
+  * CO and temp are ignored by default. Pass --sensors to enable them.
 
 Options:
     --mirror          flip the view like a selfie camera (your own left = LEFT)
@@ -29,6 +32,7 @@ Options:
     --loop            replay a video file forever (Ctrl+C to stop)
     --co-delta-mv N   CO mV above baseline that triggers UNSAFE (default 25)
     --co-clear-s N    seconds the CO reading must stay low before leaving UNSAFE
+    --max-people N    exit closes (away) when N or more people are in frame (default 3)
 Keys: q or Esc quits; the strip gets OFF on exit.
 """
 import argparse
@@ -42,6 +46,7 @@ import cv2
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "stm32_camera"))
+sys.path.insert(0, os.path.join(ROOT, "cv_node"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from led_client import BOARD_IP, LED_PORT, LedStrip     # noqa: E402
@@ -50,36 +55,112 @@ from region_logic import (BOUNDARY_HI, BOUNDARY_LO, LEFT, OFF, RIGHT,  # noqa: E
                           STRAIGHT, RegionTracker)
 
 UNSAFE = "UNSAFE"
-ALLOWED = (LEFT, STRAIGHT, RIGHT, OFF, UNSAFE)
-PERSON_CLASS_ID = 0                          # COCO "person"
+AWAY = "AWAY"                                # exit closed: diverge from middle
+ALLOWED = (LEFT, STRAIGHT, RIGHT, OFF, UNSAFE, AWAY)
+PERSON_CLASS_ID = 0                          # "person" (COCO and YOLO-World vocab)
+TRASH_LABELS = ("trash can", "garbage can", "bin")
+DEFAULT_MODEL = os.path.join(ROOT, "cv_node", "yolov8s-worldv2.pt")
 HEARTBEAT_S = 1.0                            # board times out after 5 s
 STREAM_STALE_S = 2.0                         # no camera frame this long -> stop sending
 COLOURS = {LEFT: (255, 200, 0), STRAIGHT: (0, 220, 0), RIGHT: (0, 160, 255),
-           OFF: (160, 160, 160), UNSAFE: (0, 0, 255)}
+           OFF: (160, 160, 160), UNSAFE: (0, 0, 255), AWAY: (0, 140, 255)}
+
+
+class TrashHazard:
+    """Trash can in the camera view -> simulated path hazard (UNSAFE)."""
+
+    def __init__(self, conf=0.25, persist_s=0.6, clear_s=1.0):
+        self.conf = conf
+        self.persist_s = persist_s
+        self.clear_s = clear_s
+        self.active = False
+        self._seen_since = None
+        self._clear_since = None
+        self.boxes = []          # [(x1,y1,x2,y2,conf,label)] last frame
+
+    def update(self, result, now):
+        hits = []
+        if result is not None and result.boxes is not None and len(result.boxes):
+            names = result.names or {}
+            xyxy = result.boxes.xyxy.cpu().numpy()
+            conf = result.boxes.conf.cpu().numpy()
+            cls = result.boxes.cls.int().cpu().tolist()
+            for box, c, k in zip(xyxy, conf, cls):
+                label = str(names.get(k, k)).lower()
+                if c < self.conf:
+                    continue
+                if any(t in label for t in TRASH_LABELS):
+                    hits.append((tuple(map(float, box)), float(c), label))
+        self.boxes = hits
+        if hits:
+            self._clear_since = None
+            if self._seen_since is None:
+                self._seen_since = now
+            if not self.active and (now - self._seen_since) >= self.persist_s:
+                self.active = True
+                best = max(hits, key=lambda h: h[1])
+                print(f"[{time.strftime('%H:%M:%S')}] HAZARD trash can "
+                      f"({best[2]} {best[1]:.2f}) -> UNSAFE", flush=True)
+        else:
+            self._seen_since = None
+            if self.active:
+                if self._clear_since is None:
+                    self._clear_since = now
+                elif now - self._clear_since >= self.clear_s:
+                    print(f"[{time.strftime('%H:%M:%S')}] trash can clear", flush=True)
+                    self.active = False
+                    self._clear_since = None
+        return self.active
 
 
 class CoHazard:
-    """Rising CO / reducing-gas reading (blow into the MiCS-5524) -> UNSAFE."""
+    """Rising CO / reducing-gas reading (blow into the MiCS-5524) -> UNSAFE.
 
-    def __init__(self, delta_mv=25.0, clear_s=3.0):
+    Starts with a warm-up that only learns the baseline (no UNSAFE), so a high
+    reading at process start does not latch a false hazard.
+    """
+
+    def __init__(self, delta_mv=25.0, clear_s=3.0, warm_s=12.0):
         self.delta_mv = delta_mv
         self.clear_s = clear_s
+        self.warm_s = warm_s
         self.baseline_mv = None
         self.unsafe = False
         self._clear_since = None
+        self._t0 = None
         self.last_mv = None
         self.last_ppm = None
+
+    def reset(self, now=None):
+        """Clear hazard and re-learn baseline from the next samples."""
+        self.baseline_mv = None
+        self.unsafe = False
+        self._clear_since = None
+        self._t0 = now
+        print(f"[{time.strftime('%H:%M:%S')}] CO reset: re-baselining for {self.warm_s:.0f} s",
+              flush=True)
 
     def update(self, sensor, now):
         if not sensor or sensor.get("co_v") is None:
             return self.unsafe
+        if self._t0 is None:
+            self._t0 = now
         mv = float(sensor["co_v"]) * 1000.0
         self.last_mv = mv
         self.last_ppm = sensor.get("co_ppm")
+
+        warming = (now - self._t0) < self.warm_s
         if self.baseline_mv is None:
             self.baseline_mv = mv
-        elif not self.unsafe:
-            self.baseline_mv += 0.05 * (mv - self.baseline_mv)
+        elif warming or not self.unsafe:
+            # Faster track while warming; slow track once armed and clear.
+            alpha = 0.25 if warming else 0.05
+            self.baseline_mv += alpha * (mv - self.baseline_mv)
+
+        if warming:
+            self.unsafe = False
+            self._clear_since = None
+            return False
 
         if mv >= self.baseline_mv + self.delta_mv:
             if not self.unsafe:
@@ -96,13 +177,20 @@ class CoHazard:
                 self._clear_since = None
         return self.unsafe
 
-    def label(self):
+    def label(self, now=None):
         if self.last_mv is None:
             return "CO n/a"
         ppm = self.last_ppm
-        extra = " warming" if ppm == "warming" else (f" ~{float(ppm):.0f} ppm" if ppm is not None else "")
-        state = "UNSAFE" if self.unsafe else "ok"
+        extra = " sensor-warm" if ppm == "warming" else (
+            f" ~{float(ppm):.0f} ppm" if ppm is not None else "")
         base = f"{self.baseline_mv:.0f}" if self.baseline_mv is not None else "?"
+        learning = (self._t0 is not None and now is not None and
+                    (now - self._t0) < self.warm_s)
+        if learning:
+            left = max(0.0, self.warm_s - (now - self._t0))
+            state = f"learning {left:.0f}s"
+        else:
+            state = "UNSAFE" if self.unsafe else "ok"
         return f"CO {self.last_mv:.0f} mV (base {base}) {state}{extra}"
 
 
@@ -276,7 +364,7 @@ class PreviewServer:
         self._httpd.shutdown()
 
 
-def pick_person(result, target_id):
+def pick_person(result, target_id, person_cls=PERSON_CLASS_ID):
     """All person boxes, the one that steers, and its track id.
 
     The steering person stays the same (by track id) while they are in view, so the
@@ -285,30 +373,27 @@ def pick_person(result, target_id):
         return [], None, target_id
     xyxy = result.boxes.xyxy.cpu().numpy()
     conf = result.boxes.conf.cpu().numpy()
+    cls = result.boxes.cls.int().cpu().tolist()
     ids = result.boxes.id.int().cpu().tolist() if result.boxes.id is not None else [None] * len(xyxy)
-    boxes = [(tuple(map(float, b)), float(c)) for b, c in zip(xyxy, conf)]
-    if target_id is not None and target_id in ids:
-        i = ids.index(target_id)
+    people = [(tuple(map(float, b)), float(c), tid)
+              for b, c, k, tid in zip(xyxy, conf, cls, ids) if k == person_cls]
+    if not people:
+        return [], None, target_id
+    boxes = [(b, c) for b, c, _ in people]
+    tids = [tid for _, _, tid in people]
+    if target_id is not None and target_id in tids:
+        i = tids.index(target_id)
     else:
-        i = max(range(len(boxes)), key=lambda k: (boxes[k][0][2] - boxes[k][0][0]) * (boxes[k][0][3] - boxes[k][0][1]))
-    return boxes, boxes[i], ids[i]
+        i = max(range(len(boxes)), key=lambda k: (boxes[k][0][2] - boxes[k][0][0]) *
+                 (boxes[k][0][3] - boxes[k][0][1]))
+    return boxes, boxes[i], tids[i]
 
 
-def draw(frame, boxes, target, tracker, now, fps, margin, link_text, led_command=None, sensor_lines=None):
+def draw(frame, boxes, target, tracker, now, fps, margin, link_text, led_command=None,
+         sensor_lines=None, exit_open=True, max_people=3, trash_boxes=None):
     h, w = frame.shape[:2]
     command = led_command or tracker.command
     colour = COLOURS.get(command, COLOURS[OFF])
-
-    # Region boundaries (solid) and the hysteresis band around them (thin).
-    for b in (BOUNDARY_LO, BOUNDARY_HI):
-        x = int(b * w)
-        cv2.line(frame, (x, 0), (x, h), (255, 255, 255), 2)
-        for dx in (-margin, margin):
-            xx = int((b + dx) * w)
-            cv2.line(frame, (xx, 0), (xx, h), (120, 120, 120), 1)
-    for label, x0 in ((LEFT, 0.0), (STRAIGHT, BOUNDARY_LO), (RIGHT, BOUNDARY_HI)):
-        cv2.putText(frame, label, (int(x0 * w) + 8, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    COLOURS[label] if label == command else (200, 200, 200), 2)
 
     for (x1, y1, x2, y2), conf in boxes:
         if target is not None and (x1, y1, x2, y2) == target[0]:
@@ -320,13 +405,21 @@ def draw(frame, boxes, target, tracker, now, fps, margin, link_text, led_command
         cv2.putText(frame, f"person {conf:.2f}", (int(x1), max(15, int(y1) - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 2)
         cv2.circle(frame, (int((x1 + x2) / 2), int((y1 + y2) / 2)), 6, (0, 0, 255), -1)
+    for (x1, y1, x2, y2), conf, label in (trash_boxes or []):
+        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+        cv2.putText(frame, f"HAZARD {label} {conf:.2f}", (int(x1), max(15, int(y1) - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
     if tracker.x is not None:                       # smoothed position the decision uses
         sx = int(tracker.x * w)
         cv2.line(frame, (sx, 0), (sx, 18), (0, 0, 255), 3)
 
     n_people = len(boxes)
+    exit_line = (f"Exit OPEN  ({n_people}/{max_people} people — go)"
+                 if exit_open else
+                 f"Exit CLOSED  ({n_people}/{max_people} people — go away)")
     lines = [
         f"LED: {command}",
+        exit_line,
         f"People in frame: {n_people}",
         f"{fps:.1f} fps   {link_text}",
     ]
@@ -343,13 +436,16 @@ def draw(frame, boxes, target, tracker, now, fps, margin, link_text, led_command
         cv2.putText(frame, text, (8, y + th + 2), cv2.FONT_HERSHEY_SIMPLEX, scale,
                     colour if i == 0 else (255, 255, 255), 2)
         y += th + 16
-    # Big occupancy badge, top-right.
+    # Big occupancy badge, top-right (green = exit open, red = closed).
     badge = f"{n_people}"
+    badge_colour = (0, 220, 0) if exit_open else (0, 0, 255)
     (bw, bh), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 1.6, 3)
     bx = w - bw - 24
-    cv2.rectangle(frame, (bx - 12, 8), (w - 8, 8 + bh + 28), (0, 0, 0), -1)
+    cv2.rectangle(frame, (bx - 12, 8), (w - 8, 8 + bh + 44), (0, 0, 0), -1)
     cv2.putText(frame, "PEOPLE", (bx - 4, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-    cv2.putText(frame, badge, (bx, 8 + bh + 20), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 255, 255), 3)
+    cv2.putText(frame, badge, (bx, 8 + bh + 20), cv2.FONT_HERSHEY_SIMPLEX, 1.6, badge_colour, 3)
+    cv2.putText(frame, "OPEN" if exit_open else "CLOSED", (bx - 4, 8 + bh + 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, badge_colour, 2)
 
 
 def main():
@@ -357,8 +453,13 @@ def main():
     p.add_argument("--url", default=DEFAULT_URL, help="MJPEG stream (default %(default)s)")
     p.add_argument("--board", default=BOARD_IP, help="LED command target (default %(default)s)")
     p.add_argument("--source", help="video file or webcam index instead of the STM32 stream")
-    p.add_argument("--model", default=os.path.join(ROOT, "cv_node", "yolov8n.pt"))
-    p.add_argument("--conf", type=float, default=0.45, help="person confidence threshold")
+    p.add_argument("--model", default=DEFAULT_MODEL,
+                   help="YOLO weights (default: YOLO-World for trash-can hazard)")
+    p.add_argument("--conf", type=float, default=0.35, help="person confidence threshold")
+    p.add_argument("--trash-conf", type=float, default=0.25,
+                   help="trash-can confidence for simulated UNSAFE hazard")
+    p.add_argument("--no-trash-hazard", action="store_true",
+                   help="disable trash-can -> UNSAFE simulation")
     p.add_argument("--device", default=None, help="torch device, e.g. cpu or mps (default: auto)")
     p.add_argument("--mirror", action="store_true", help="flip the view horizontally")
     p.add_argument("--margin", type=float, default=0.05, help="hysteresis, fraction of width")
@@ -372,13 +473,20 @@ def main():
                    help="CO mV above slow baseline that triggers UNSAFE (default %(default)s)")
     p.add_argument("--co-clear-s", type=float, default=3.0,
                    help="seconds CO must stay low before leaving UNSAFE (default %(default)s)")
+    p.add_argument("--max-people", type=int, default=3,
+                   help="exit closes (away pattern) when this many or more people are in frame")
+    p.add_argument("--sensors", action="store_true",
+                   help="use CO (UNSAFE) and show temp/CO on the preview (off by default)")
     p.add_argument("--seconds", type=float, help="stop after this many seconds")
     args = p.parse_args()
 
-    from ultralytics import YOLO
-    model = YOLO(args.model)
+    from hazard_detector import load_model
+    model = load_model(args.model)
+    print(f"model: {args.model}  classes: {list(model.names.values())[:8]}...")
     tracker = RegionTracker(margin=args.margin, dwell_s=args.dwell, lost_s=args.lost)
+    trash_hazard = TrashHazard(conf=args.trash_conf)
     co_hazard = CoHazard(delta_mv=args.co_delta_mv, clear_s=args.co_clear_s)
+    co_hazard.reset(time.time())
     sender = CommandSender(args.board, dry_run=args.dry_run)
     sender.start()
     preview = PreviewServer(args.preview_port) if args.preview_port else None
@@ -392,14 +500,16 @@ def main():
         src, cam = None, CameraStream(args.url)
         print(f"source: {args.url}")
     print(f"LED commands: {'dry run' if args.dry_run else f'udp://{args.board}:{LED_PORT}'}"
-          f"  (person -> LEFT/STRAIGHT/RIGHT/OFF; CO spike -> UNSAFE, "
-          f"delta {args.co_delta_mv:.0f} mV, clear {args.co_clear_s:.0f} s)")
+          f"  (trash can -> UNSAFE; >= {args.max_people} people -> AWAY; "
+          f"else LEFT/STRAIGHT/RIGHT/OFF"
+          f"{'; CO on' if args.sensors else '; CO/temp ignored'})")
 
     window = "EvacAI guidance - q to quit"
     last_frame_time = time.time()
     frame_times = []
     target_id = None
     last_people = None
+    last_exit_open = None
     end = time.time() + args.seconds if args.seconds else None
     show = not args.no_window
     try:
@@ -426,7 +536,8 @@ def main():
 
             if args.mirror:
                 frame = cv2.flip(frame, 1)
-            result = model.track(frame, persist=True, classes=[PERSON_CLASS_ID], conf=args.conf,
+            # Detect people + trash can in one YOLO-World pass (no class filter).
+            result = model.track(frame, persist=True, conf=min(args.conf, args.trash_conf),
                                  device=args.device, verbose=False)[0]
             boxes, target, target_id = pick_person(result, target_id)
             n_people = len(boxes)
@@ -438,7 +549,25 @@ def main():
                 (x1, _, x2, _), _ = target
                 x = (x1 + x2) / 2.0 / frame.shape[1]
             person_cmd = tracker.update(x, now)
-            if co_hazard.update(sensor, now):
+            # Close at N people (not N+1): 2 detected with --max-people 2 -> away.
+            exit_open = n_people < args.max_people
+            if exit_open != last_exit_open:
+                state = "OPEN" if exit_open else "CLOSED"
+                print(f"[{time.strftime('%H:%M:%S')}] exit {state} "
+                      f"({n_people}/{args.max_people} people)", flush=True)
+                last_exit_open = exit_open
+            trash_unsafe = False
+            if not args.no_trash_hazard:
+                trash_unsafe = trash_hazard.update(result, now)
+            co_unsafe = False
+            if args.sensors:
+                co_unsafe = co_hazard.update(sensor, now)
+            # Precedence: trash UNSAFE > crowd AWAY > optional CO > person L/S/R/OFF.
+            if trash_unsafe:
+                led_cmd = UNSAFE
+            elif not exit_open:
+                led_cmd = AWAY
+            elif co_unsafe:
                 led_cmd = UNSAFE
             else:
                 led_cmd = person_cmd
@@ -456,24 +585,26 @@ def main():
                 else:
                     link = f"board: {sender.last_reply} ({wall - sender.last_ack_time:.1f} s ago)"
                 overlay_sensors = []
-                if sensor:
-                    if sensor.get("temp_c") is not None:
+                if args.sensors:
+                    if sensor and sensor.get("temp_c") is not None:
                         rh = sensor.get("humidity_pct")
                         rh_txt = f"  {rh:.0f}% RH" if rh is not None and rh == rh else ""
                         age = float(sensor.get("age_s") or 0.0)
-                        # Board keeps the last good DHT11 reading; mark it when it is stale.
                         if age > 5.0:
                             overlay_sensors.append(
                                 f"Temp {sensor['temp_c']:.1f} C{rh_txt}  STALE {age:.0f}s (DHT11 not answering)")
                         else:
                             overlay_sensors.append(f"Temp {sensor['temp_c']:.1f} C{rh_txt}")
                     else:
-                        overlay_sensors.append("Temp n/a (DHT11)")
-                else:
-                    overlay_sensors.append("Temp n/a")
-                overlay_sensors.append(co_hazard.label())
+                        overlay_sensors.append("Temp n/a")
+                    overlay_sensors.append(co_hazard.label(now=now))
+                if trash_hazard.boxes or trash_hazard.active:
+                    overlay_sensors.append(
+                        "HAZARD: trash can" if trash_hazard.active else "trash can (watching)")
                 draw(frame, boxes, target, tracker, now, fps, args.margin, link,
-                     led_command=led_cmd, sensor_lines=overlay_sensors)
+                     led_command=led_cmd, sensor_lines=overlay_sensors or None,
+                     exit_open=exit_open, max_people=args.max_people,
+                     trash_boxes=trash_hazard.boxes)
             if preview:
                 preview.push(frame)
             if show:
